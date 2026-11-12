@@ -8,12 +8,19 @@ sys.path.insert(0, str(ROOT))
 
 
 def _ensure_samples() -> None:
-    healthy_log = ROOT / "samples" / "healthy_table" / "_delta_log"
-    incident_log = ROOT / "samples" / "incident_table" / "_delta_log"
-    if not healthy_log.glob("*.json") or not incident_log.glob("*.json"):
-        sys.path.insert(0, str(ROOT / "scripts"))
-        from generate_samples import main as generate  # noqa: E402
-        generate()
+    sample_dirs = ("healthy_table", "incident_table",
+                   "encoding_table", "legacy_manifest_table")
+    missing = [name for name in sample_dirs
+               if not any((ROOT / "samples" / name / "_delta_log").glob("*.json"))]
+    if not missing:
+        return
+    scripts_dir = ROOT / "scripts"
+    sys.path.insert(0, str(scripts_dir))
+    # 隔离模式下没有 site-packages 之外的路径问题，但生成脚本依赖 pyarrow；
+    # 用户可能只想跑部分测试，因此样例缺失时必须成功生成。
+    import importlib
+    generate_samples = importlib.import_module("generate_samples")
+    generate_samples.main()
 
 
 _ensure_samples()

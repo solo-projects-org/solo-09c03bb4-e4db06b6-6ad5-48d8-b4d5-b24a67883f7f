@@ -1,0 +1,2 @@
+{"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}
+{"add": {"path": "data/part-00000-literal%2520name.parquet", "partitionValues": {}, "size": 1024, "modificationTime": 1700000000000, "dataChange": true}}

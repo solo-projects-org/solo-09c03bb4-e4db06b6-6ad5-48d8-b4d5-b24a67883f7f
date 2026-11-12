@@ -1,0 +1,5 @@
+# 对象存储导出（原样文件名）：空格就是空格，%20 就是字面 %20
+# format: raw  —— 原样路径，服务端不解码
+data/part-00000-literal%20name.parquet
+data/part-00001-space name.parquet
+data/part-00002-literal%20name.parquet

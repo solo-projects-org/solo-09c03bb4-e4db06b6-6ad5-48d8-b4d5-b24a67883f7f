@@ -18,6 +18,7 @@ from app.analyzer import (
     InputFile,
     STATUS_MISSING_COMMIT,
     STATUS_MISSING_FILES,
+    STATUS_PENDING_CONFIRMATION,
     STATUS_RECOVERABLE,
     analyze,
     normalize_data_path,
@@ -309,3 +310,223 @@ def test_no_manifest_means_every_referenced_file_is_missing():
     assert v2["status"] == STATUS_MISSING_FILES
     assert v2["missing_files"] == sorted([f(0), f(2), f(3)])
     assert report["existing_file_count"] == 0
+
+
+# ---------- 清单路径格式：原样 / URI 编码 / 未注明 ----------
+
+SPACE = "data/part-00000-literal name.parquet"
+LITERAL = "data/part-00000-literal%20name.parquet"
+
+
+def uri_log_path(path: str) -> str:
+    """模拟 Delta 日志里的 URI 编码路径（字面 %20 会变成 %2520）。"""
+    import urllib.parse
+    return urllib.parse.quote(path, safe="/")
+
+
+def test_decode_uri_path_once_only():
+    from app.analyzer import decode_uri_path_once, normalize_raw_path
+    # 只解码一次：%2520 变成字面 %20，而不是空格
+    assert decode_uri_path_once("data/a%2520b.parquet") == "data/a%20b.parquet"
+    assert decode_uri_path_once("./data/a%20b.parquet") == "data/a b.parquet"
+    # 原样入口不解码
+    assert normalize_raw_path("data/a%20b.parquet") == "data/a%20b.parquet"
+    assert normalize_raw_path("./data/a%20b.parquet") == "data/a%20b.parquet"
+    assert normalize_raw_path("/data/a%20b.parquet") == "data/a%20b.parquet"
+
+
+def _encoding_logs() -> list[InputFile]:
+    # 日志引用：字面 %20 文件与含空格文件各一个
+    return [commit_file(0, [add(uri_log_path(LITERAL)),
+                            add(uri_log_path(SPACE))])]
+
+
+def test_raw_manifest_keeps_literal_percent20_and_space_distinct():
+    report = analyze(_encoding_logs(),
+                     [InputFile(filename="export.raw.txt",
+                                data=f"{LITERAL}\n{SPACE}\n".encode(),
+                                path_format="raw")], 0, 0)
+    v0 = report["versions"][0]
+    assert v0["status"] == STATUS_RECOVERABLE
+    assert v0["missing_files"] == []
+    assert report["existing_file_count"] == 2
+
+
+def test_uri_manifest_decodes_exactly_once():
+    # URI 清单里字面 %20 编码为 %2520、空格编码为 %20，各解码一次
+    body = f"{uri_log_path(LITERAL)}\n{uri_log_path(SPACE)}\n".encode()
+    report = analyze(_encoding_logs(),
+                     [InputFile(filename="backup.uri.txt", data=body,
+                                path_format="uri")], 0, 0)
+    assert report["versions"][0]["status"] == STATUS_RECOVERABLE
+
+
+def test_raw_manifest_space_encoded_line_does_not_confirm_space_file():
+    # 原样清单把两个文件名都写成 %20 —— 只能确认字面 %20 的那个文件，
+    # 含空格的那个文件（日志里是 %20）仍缺失，不能被误判为可回退
+    body = f"{LITERAL}\ndata/part-00000-space%20name.parquet\n".encode()
+    report = analyze(_encoding_logs(),
+                     [InputFile(filename="export.raw.txt", data=body,
+                                path_format="raw")], 0, 0)
+    v0 = report["versions"][0]
+    assert v0["status"] == STATUS_MISSING_FILES
+    assert v0["missing_files"] == [SPACE]
+    assert LITERAL not in v0["missing_files"]
+
+
+def test_unmarked_legacy_entry_same_raw_and_decoded_confirms():
+    report = analyze([commit_file(0, [add("data/plain.parquet")])],
+                     [InputFile(filename="legacy.txt",
+                                data=b"data/plain.parquet\n")], 0, 0)
+    v0 = report["versions"][0]
+    assert v0["status"] == STATUS_RECOVERABLE
+    assert report["manifests"] == ["legacy.txt"]
+
+
+def test_unmarked_legacy_ambiguous_entry_marks_both_paths_pending():
+    # 旧清单只写 %20，原样和 URI 解码结果不同：两条路径都待确认，
+    # 既不能算现存，也不能判为缺失
+    report = analyze(_encoding_logs(),
+                     [InputFile(filename="legacy.txt",
+                                data=f"{LITERAL}\n".encode())], 0, 0)
+    v0 = report["versions"][0]
+    assert v0["status"] == STATUS_PENDING_CONFIRMATION
+    assert v0["missing_files"] == []
+    assert LITERAL in v0["pending_files"]
+    assert SPACE in v0["pending_files"]
+    assert report["summary"][STATUS_PENDING_CONFIRMATION] == 1
+    for detail in v0["file_details"]:
+        if detail["path"] in (LITERAL, SPACE):
+            assert detail["state"] == "pending"
+            assert detail["evidence"][0]["source"] == "legacy.txt"
+
+
+def test_explicit_entry_overrides_ambiguous_legacy_entry():
+    # 未注明格式的旧行把字面 %20 与空格两条路径都标为待确认；
+    # 另一份原样清单明确证实字面 %20 文件存在，则它仍算现存，
+    # 只剩空格文件待确认 -> 版本判为待确认而不是缺失
+    logs = _encoding_logs()
+    legacy = InputFile(filename="legacy.txt",
+                       data=f"{LITERAL}\n".encode())
+    explicit = InputFile(filename="export.raw.txt",
+                         data=f"{LITERAL}\n".encode(), path_format="raw")
+    report = analyze(logs, [legacy, explicit], 0, 0)
+    v0 = report["versions"][0]
+    assert v0["status"] == STATUS_PENDING_CONFIRMATION
+    assert LITERAL not in v0["pending_files"]
+    assert SPACE in v0["pending_files"]
+    detail = {d["path"]: d["state"] for d in v0["file_details"]}
+    assert detail[LITERAL] == "confirmed"
+    assert detail[SPACE] == "pending"
+    assert report["existing_file_count"] == 1
+
+
+def test_missing_commit_takes_precedence_over_pending():
+    logs = [commit_file(0, [add("data/plain%20name.parquet")])]
+    report = analyze(logs, [InputFile(filename="legacy.txt",
+                                      data=b"data/plain%20name.parquet\n")],
+                     1, 1)
+    v1 = report["versions"][0]
+    assert v1["status"] == STATUS_MISSING_COMMIT
+    assert v1["missing_commits"] == [1]
+
+
+def test_manifest_format_directive_and_filename_hint():
+    from app.analyzer import parse_manifest_entries, PATH_FORMAT_RAW, PATH_FORMAT_URI
+    entries, fmt = parse_manifest_entries(
+        b"# format: raw\ndata/a%20b.parquet\n", "m.txt")
+    assert fmt == PATH_FORMAT_RAW
+    assert entries[0].raw == "data/a%20b.parquet"
+    entries, fmt = parse_manifest_entries(
+        b"data/a%20b.parquet\n", "object_listing.raw.txt")
+    assert fmt == PATH_FORMAT_RAW
+    entries, fmt = parse_manifest_entries(
+        b"data/a%20b.parquet\n", "backup.uri.txt")
+    assert fmt == PATH_FORMAT_URI
+    entries, fmt = parse_manifest_entries(
+        "# 格式：URI 编码\ndata/a%2520b.parquet\n".encode(), "m.txt")
+    assert fmt == PATH_FORMAT_URI
+
+
+def test_manifest_format_declared_in_input_file():
+    assert InputFile(filename="m", data=b"", format="uri").path_format == "uri"
+    assert InputFile(filename="m", data=b"", path_format="raw").path_format == "raw"
+    with pytest.raises(AnalyzerError, match="路径格式"):
+        analyze([commit_file(0, [add("a.parquet")])],
+                [InputFile(filename="m", data=b"a.parquet\n",
+                           path_format="bogus")], 0, 0)
+
+
+def test_json_commit_and_checkpoint_paths_decode_once():
+    lit_log = uri_log_path(LITERAL)  # data/...literal%2520name...
+    commit = parse_commit(0, json.dumps({"add": {"path": lit_log}}).encode(),
+                          "0.json")
+    assert commit.adds[0][0] == LITERAL
+    ck = checkpoint_file(0, [lit_log])
+    parsed = parse_checkpoint(0, ck.data, ck.filename)
+    assert parsed.adds == [LITERAL]
+
+
+def test_explicit_missing_file_wins_over_pending():
+    # 一条引用文件被明确判定缺失，另一条待确认：版本仍应报缺失文件
+    report = analyze([commit_file(0, [add(uri_log_path(LITERAL)),
+                                      add("data/gone.parquet")])],
+                     [InputFile(filename="legacy.txt",
+                                data=f"{LITERAL}\n".encode())], 0, 0)
+    v0 = report["versions"][0]
+    assert v0["status"] == STATUS_MISSING_FILES
+    assert v0["missing_files"] == ["data/gone.parquet"]
+    assert LITERAL in v0["pending_files"]
+
+
+def test_same_scenario_three_manifest_modes():
+    """同一行 ``…%20…`` 在三种清单格式下的结论必须不同。
+
+    日志引用的是含空格文件（URI 编码为 ``literal%20name``）：
+    - 原样清单：该行指的是字面 %20 文件，含空格文件缺失；
+    - URI 清单：解码一次得到含空格文件，可回退；
+    - 未注明清单：两种解释都成立，两条路径待确认。
+    """
+    import urllib.parse
+    literal = "data/part-00002-literal%20name.parquet"
+    space = "data/part-00002-literal name.parquet"
+    logs = [commit_file(0, [add(urllib.parse.quote(space, safe="/"))])]
+    body = f"{literal}\n".encode()
+
+    raw = analyze(logs, [InputFile(filename="a.raw.txt", data=body,
+                                   path_format="raw")], 0, 0)
+    assert raw["versions"][0]["status"] == STATUS_MISSING_FILES
+    assert raw["versions"][0]["missing_files"] == [space]
+
+    uri = analyze(logs, [InputFile(filename="a.uri.txt", data=body,
+                                   path_format="uri")], 0, 0)
+    assert uri["versions"][0]["status"] == STATUS_RECOVERABLE
+
+    auto = analyze(logs, [InputFile(filename="legacy.txt", data=body)], 0, 0)
+    assert auto["versions"][0]["status"] == STATUS_PENDING_CONFIRMATION
+    assert auto["versions"][0]["pending_files"] == [space]
+    assert auto["pending_file_count"] == 2
+
+
+def test_analyze_accepts_manifest_format_arguments():
+    import urllib.parse
+    literal = "data/lit%20name.parquet"
+    logs = [commit_file(0, [add(urllib.parse.quote(literal, safe="/"))])]
+    mf = [InputFile(filename="m.txt", data=f"{literal}\n".encode())]
+    # 未声明 -> 歧义待确认
+    assert analyze(logs, mf, 0, 0)["versions"][0]["status"] == \
+        STATUS_PENDING_CONFIRMATION
+    # 全局格式
+    assert analyze(logs, mf, 0, 0,
+                   manifest_format="raw")["versions"][0]["status"] == \
+        STATUS_RECOVERABLE
+    # 按位置列表
+    assert analyze(logs, mf, 0, 0,
+                   manifest_formats=["raw"])["versions"][0]["status"] == \
+        STATUS_RECOVERABLE
+    # 按位置字典
+    assert analyze(logs, mf, 0, 0,
+                   manifest_formats={0: "uri"})["versions"][0]["status"] == \
+        STATUS_MISSING_FILES
+    with pytest.raises(AnalyzerError, match="列表或字典"):
+        analyze(logs, mf, 0, 0, manifest_formats="raw")

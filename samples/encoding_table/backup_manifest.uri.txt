@@ -1,0 +1,5 @@
+# 备份清单（URI 编码）：%20 与 %2520 各解码一次
+# format: uri  —— URI 编码路径，服务端只解码一次
+data/part-00000-literal%2520name.parquet
+data/part-00001-space%20name.parquet
+data/part-00002-literal%2520name.parquet

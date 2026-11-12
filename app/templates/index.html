@@ -45,6 +45,7 @@
     .badge-recoverable { background: var(--green-bg); color: var(--green-fg); }
     .badge-missing_commit { background: var(--red-bg); color: var(--red-fg); }
     .badge-missing_files { background: var(--amber-bg); color: var(--amber-fg); }
+    .badge-pending_confirmation { background: #eef2ff; color: #2b4acb; }
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
     th, td { border-bottom: 1px solid var(--line); padding: 10px 8px; text-align: left;
              vertical-align: top; }
@@ -53,7 +54,9 @@
     .filelist { margin: 6px 0 0; padding-left: 18px; font-family: ui-monospace, monospace;
                 font-size: 12px; word-break: break-all; }
     .filelist li.missing { color: var(--red-fg); font-weight: 700; }
+    .filelist li.pending { color: #2b4acb; font-weight: 700; }
     .filelist li.ok { color: #374151; }
+    .evidence { color: var(--muted); font-weight: 400; font-size: 11px; }
     .miss-commits { color: var(--red-fg); font-weight: 700; font-family: ui-monospace, monospace; }
     .kv { font-size: 13px; color: var(--muted); }
     .kv code { background: #f1f4f9; padding: 1px 6px; border-radius: 4px; color: #334155; }
@@ -97,8 +100,19 @@
         <div class="hint">文件名须保持 20 位补零版本号，如 00000000000000000003.json、
           00000000000000000002.checkpoint.parquet</div>
         <label for="manifest_files">现存数据文件表内相对路径清单（可多选，每行一个路径）</label>
-        <input type="file" id="manifest_files" name="manifest_files" multiple accept=".txt,.csv">
+        <input type="file" id="manifest_files" name="manifest_files" multiple
+               accept=".txt,.csv,.list">
         <div class="hint">例如 data/part-00000-aaa.parquet；缺失清单时所有引用文件都会被判为缺失</div>
+        <div id="manifest-format-rows"></div>
+        <div class="hint">
+          每份清单可单独选择路径格式（默认“未注明”，即旧清单）：
+          原样路径逐行按字面保留，<code>a%20b.parquet</code> 指向文件名含字面 %20 的文件；
+          URI 编码清单只解码一次，<code>a%20b.parquet</code> 指向 <code>a b.parquet</code>。
+          未注明格式时两种解释结果相同即算现存，指向不同路径则两条都标为待确认。
+          也可在清单首行写 <code># format: raw</code> / <code># format: uri</code>，
+          或用文件名提示（如 <code>object_store_export.raw.txt</code>、
+          <code>backup_manifest.uri.txt</code>）。
+        </div>
         <button class="btn-primary" type="submit" id="submit-btn">开始逐版分析</button>
       </form>
     </section>
@@ -126,8 +140,17 @@
     const STATUS_TEXT = {
       recoverable: "可重建 · 文件齐全",
       missing_commit: "缺失提交，重放中断",
-      missing_files: "重放完整但缺数据文件"
+      missing_files: "重放完整但缺数据文件",
+      pending_confirmation: "文件待确认，暂不可回退"
     };
+
+    const FILE_STATE_LABEL = {
+      confirmed: "✓ 已确认现存",
+      pending: "? 待确认",
+      missing: "✗ 缺失"
+    };
+
+    const FORMAT_TEXT = {raw: "原样路径", uri: "URI 编码", auto: "未注明（自动判断）"};
 
     function esc(s) {
       return String(s).replace(/[&<>"']/g, c =>
@@ -143,11 +166,23 @@
     function renderReport(r) {
       const s = r.summary;
       const rows = r.versions.map(v => {
-        const files = v.referenced_files.map(p => {
-          const miss = v.missing_files.includes(p);
-          return '<li class="' + (miss ? 'missing' : 'ok') + '">' +
-            (miss ? '✗ 缺失 ' : '✓ ') + esc(p) + '</li>';
+        const details = (v.file_details || v.referenced_files.map(p => ({
+          path: p,
+          state: v.missing_files.includes(p) ? 'missing' : 'confirmed'
+        })));
+        const files = details.map(d => {
+          let extra = '';
+          if (d.state === 'pending' && d.evidence && d.evidence.length) {
+            extra = '<div class="evidence">清单证据：' +
+              d.evidence.map(e => esc(e.source) + ' 第 ' + e.line + ' 行「' +
+                esc(e.raw) + '」（格式：' + esc(FORMAT_TEXT[e.format] || e.format) +
+                '，可读作「' + esc(e.decoded) + '」）').join('；') + '</div>';
+          }
+          return '<li class="' + (d.state === 'confirmed' ? 'ok' :
+              (d.state === 'pending' ? 'pending' : 'missing')) + '">' +
+            FILE_STATE_LABEL[d.state] + ' ' + esc(d.path) + extra + '</li>';
         }).join('');
+        const pendingCount = (v.pending_files || []).length;
         return '<tr>' +
           '<td class="ver">v' + v.version + '</td>' +
           '<td><span class="badge badge-' + v.status + '">' + STATUS_TEXT[v.status] + '</span></td>' +
@@ -158,7 +193,8 @@
                 v.missing_commits.map(c => 'v' + c).join(', ') + '</span>'
               : '<span class="kv">连续无断档</span>') + '</td>' +
           '<td><div class="kv">快照引用 ' + v.referenced_file_count + ' 个文件，' +
-            '缺失 ' + v.missing_files.length + ' 个</div>' +
+            '缺失 ' + v.missing_files.length + ' 个' +
+            (pendingCount ? '，待确认 ' + pendingCount + ' 个' : '') + '</div>' +
             (files ? '<details><summary>查看文件核对明细</summary><ul class="filelist">' +
               files + '</ul></details>' : '') + '</td>' +
           '</tr>';
@@ -166,6 +202,18 @@
 
       const ignored = (r.ignored_files || []).map(i =>
         '<div class="ignored">• <strong>' + esc(i.name) + '</strong>：' + esc(i.reason) + '</div>'
+      ).join('');
+
+      const manifestInfo = (r.manifest_info || []).map(m =>
+        '<div class="ignored">• <strong>' + esc(m.name) + '</strong>：' +
+          esc(FORMAT_TEXT[m.path_format] || m.path_format) + '，' +
+          m.entry_count + ' 条记录' +
+          (m.ambiguous_count
+            ? '（其中 ' + m.ambiguous_count + ' 条原样/解码结果不同，' +
+              (m.path_format === 'auto'
+                ? '已按两种路径标为待确认）'
+                : '已按所声明格式解释）')
+            : '') + '</div>'
       ).join('');
 
       return '' +
@@ -177,13 +225,18 @@
             '</div><div class="lbl">缺失提交号 / 重放中断</div></div>' +
           '<div class="stat"><div class="num" style="color:var(--amber-fg)">' + s.missing_files +
             '</div><div class="lbl">重放完整但缺数据文件</div></div>' +
+          '<div class="stat"><div class="num" style="color:#2b4acb">' +
+            (s.pending_confirmation || 0) +
+            '</div><div class="lbl">引用文件待确认，暂不可回退</div></div>' +
         '</div></section>' +
       '<section class="card"><h2>输入材料盘点</h2>' +
         '<div class="kv">已识别 JSON 提交：' + chips(r.available_commits.map(v => 'v' + v)) + '</div>' +
         '<div class="kv" style="margin-top:8px">已识别检查点：' +
           chips(r.available_checkpoints.map(v => 'v' + v)) + '</div>' +
         '<div class="kv" style="margin-top:8px">现存清单文件：' + esc((r.manifests || []).join(', ') || '（未上传）') +
-          '；清单内现存数据文件 <strong>' + r.existing_file_count + '</strong> 个</div>' +
+          '；确认现存 <strong>' + r.existing_file_count + '</strong> 个' +
+          '，待确认路径 <strong>' + (r.pending_file_count || 0) + '</strong> 个</div>' +
+        (manifestInfo ? '<div style="margin-top:8px">' + manifestInfo + '</div>' : '') +
         (r.duplicate_files && r.duplicate_files.length
           ? '<div class="ignored" style="margin-top:8px">重复上传已去重：' +
             r.duplicate_files.map(esc).join(', ') + '</div>' : '') +
@@ -205,6 +258,33 @@
     if (embedded) {
       document.getElementById('report-root').innerHTML =
         renderReport(JSON.parse(embedded.textContent));
+    }
+
+    const FORMAT_OPTIONS = [
+      ['', '未注明 / 自动判断（旧清单）'],
+      ['raw', '原样路径（对象存储导出，不解码）'],
+      ['uri', 'URI 编码（每行只解码一次）']
+    ];
+
+    function formatSelect(index, filename) {
+      const options = FORMAT_OPTIONS.map(([value, label]) =>
+        '<option value="' + value + '"' + (value === '' ? ' selected' : '') +
+        '>' + esc(label) + '</option>').join('');
+      return '<label for="mf-' + index + '">清单格式：' + esc(filename) + '</label>' +
+        '<select id="mf-' + index + '" name="manifest_format_' + index + '">' +
+        options + '</select>';
+    }
+
+    // 每选中一份清单就生成一个独立的格式下拉框（按上传顺序提交）
+    const manifestInput = document.getElementById('manifest_files');
+    const manifestRows = document.getElementById('manifest-format-rows');
+    if (manifestInput && manifestRows) {
+      manifestInput.addEventListener('change', () => {
+        manifestRows.innerHTML = '';
+        Array.from(manifestInput.files || []).forEach((file, i) => {
+          manifestRows.insertAdjacentHTML('beforeend', formatSelect(i, file.name));
+        });
+      });
     }
 
     document.getElementById('analyze-form').addEventListener('submit', () => {

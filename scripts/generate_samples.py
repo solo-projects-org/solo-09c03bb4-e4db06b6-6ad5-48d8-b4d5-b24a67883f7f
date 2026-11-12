@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import urllib.parse
 from pathlib import Path
 
 import pyarrow as pa
@@ -108,6 +109,22 @@ def write_manifest(table_dir: Path, existing: list[str]) -> None:
         target.write_bytes(b"placeholder parquet bytes for sample")
 
 
+def write_raw_manifest(path: Path, existing: list[str], note: str) -> None:
+    """写对象存储导出的原样路径清单（不做 URI 编码）。"""
+    lines = [f"# {note}",
+             "# format: raw  —— 原样路径，服务端不解码"]
+    lines.extend(existing)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_uri_manifest(path: Path, existing: list[str], note: str) -> None:
+    """写备份清单，路径统一 URI 编码（空格等写成 %XX）。"""
+    lines = [f"# {note}",
+             "# format: uri  —— URI 编码路径，服务端只解码一次"]
+    lines.extend(urllib.parse.quote(p, safe="/") for p in existing)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def reset_dir(path: Path) -> None:
     if path.exists():
         for child in sorted(path.rglob("*"), reverse=True):
@@ -171,9 +188,102 @@ def build_incident() -> None:
     write_manifest(table_dir, [a(0), a(1), a(2), a(3), a(5)])
 
 
+def build_encoding() -> None:
+    """编码核对表：演示含空格与含字面 %20 的文件如何分别判断。
+
+    - ``part-00001-space name.parquet``：日志里存 ``…space%20name…``，
+      按规范解码一次得到空格路径，该文件现存；
+    - ``part-00002-literal%20name.parquet``：文件名里本来就是字面 ``%20``，
+      日志里存 ``…literal%2520name…``，解码一次仍是字面 ``%20``，该文件现存；
+    - ``part-00002-literal name.parquet``（含空格）已被误删，日志里存
+      ``…literal%20name…``。原样清单里另有一个字面 ``%20`` 的同名文件；
+      如果照旧把清单里的 ``%20`` 当成空格，就会把这条已删除的空格文件
+      误判为现存 —— 本样例用它验证修复后判为缺失。
+    """
+    table_dir = SAMPLES / "encoding_table"
+    reset_dir(table_dir)
+    log_dir = table_dir / "_delta_log"
+    log_dir.mkdir(parents=True)
+
+    literal0 = "data/part-00000-literal%20name.parquet"
+    space1 = "data/part-00001-space name.parquet"
+    literal2 = "data/part-00002-literal%20name.parquet"
+    # 与 literal2 只差在 %20 / 空格：这条文件已被误删，且未出现在任何清单
+    space2 = "data/part-00002-literal name.parquet"
+
+    def log_path(p: str) -> str:
+        # Delta 日志中的路径按规范 URI 编码：字面 %20 会变成 %2520
+        return urllib.parse.quote(p, safe="/")
+
+    write_commit(log_dir, 0,
+                 [PROTOCOL_ACTION, add_action(log_path(literal0))])
+    write_commit(log_dir, 1, [add_action(log_path(space1))])
+    write_commit(log_dir, 2, [add_action(log_path(literal2)),
+                              add_action(log_path(space2))])
+
+    # 对象存储导出的原样清单：文件名按字面写出，%20 就是文件名的一部分
+    write_raw_manifest(
+        table_dir / "object_store_export.raw.txt",
+        [literal0, space1, literal2],
+        "对象存储导出（原样文件名）：空格就是空格，%20 就是字面 %20")
+    # 备份清单：URI 编码，解码一次后分别得到空格与字面 %20
+    write_uri_manifest(
+        table_dir / "backup_manifest.uri.txt",
+        [literal0, space1, literal2],
+        "备份清单（URI 编码）：%20 与 %2520 各解码一次")
+
+    (log_dir / "_last_checkpoint").write_text(json.dumps({
+        "version": 2, "size": 0}), encoding="utf-8")
+
+    for p in (literal0, space1, literal2):
+        target = table_dir / p
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"placeholder parquet bytes for sample")
+    # space2 故意不创建、也不写进清单：它就是在事故中被删掉的那个文件
+
+
+def build_legacy_manifest() -> None:
+    """旧清单表：清单未注明格式，原样与解码结果不同的条目都待确认。
+
+    旧清单里两行：``part-00000-literal%20name.parquet``（若按原样是字面
+    %20，若按 URI 是空格）与 ``part-00001-space name.parquet``（原样即空格，
+    解码后不变）。没有第二个来源佐证时，前者两条解释指向不同路径，标为
+    待确认；后者原样与解码相同，仍算现存。
+    """
+    table_dir = SAMPLES / "legacy_manifest_table"
+    reset_dir(table_dir)
+    log_dir = table_dir / "_delta_log"
+    log_dir.mkdir(parents=True)
+
+    literal0 = "data/part-00000-literal%20name.parquet"
+    space1 = "data/part-00001-space name.parquet"
+
+    def log_path(p: str) -> str:
+        return urllib.parse.quote(p, safe="/")
+
+    write_commit(log_dir, 0,
+                 [PROTOCOL_ACTION, add_action(log_path(literal0))])
+    write_commit(log_dir, 1, [add_action(log_path(space1))])
+
+    # 旧清单未注明格式：既不写 # format:，文件名也不带 raw/uri 提示。
+    # 这里是对象存储导出的原样清单，但服务端不能假定，需人工确认。
+    (table_dir / "legacy_listing.txt").write_text(
+        "# 旧的现存文件清单（未注明路径格式）\n"
+        f"{literal0}\n"
+        f"{space1}\n",
+        encoding="utf-8")
+
+    for p in (literal0, space1):
+        target = table_dir / p
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"placeholder parquet bytes for sample")
+
+
 def main() -> None:
     build_healthy()
     build_incident()
+    build_encoding()
+    build_legacy_manifest()
     print(f"样例已生成于 {SAMPLES}")
     for table in sorted(SAMPLES.iterdir()):
         if table.is_dir():

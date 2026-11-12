@@ -1,0 +1,3 @@
+# 旧的现存文件清单（未注明路径格式）
+data/part-00000-literal%20name.parquet
+data/part-00001-space name.parquet

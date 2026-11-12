@@ -1,0 +1,2 @@
+{"add": {"path": "data/part-00002-literal%2520name.parquet", "partitionValues": {}, "size": 1024, "modificationTime": 1700000000000, "dataChange": true}}
+{"add": {"path": "data/part-00002-literal%20name.parquet", "partitionValues": {}, "size": 1024, "modificationTime": 1700000000000, "dataChange": true}}
